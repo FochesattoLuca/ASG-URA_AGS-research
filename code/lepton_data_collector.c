@@ -6,6 +6,7 @@
 #include <time.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <linux/videodev2.h>
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
 
@@ -13,6 +14,7 @@
 #define FRAME_WIDTH 160
 #define FRAME_HEIGHT 120
 #define FRAME_SIZE (FRAME_WIDTH * FRAME_HEIGHT * 2) // 16-bit pixels
+#define VIDEO_DEVICE "/dev/video0"
 #define I2C_DEVICE "/dev/i2c-1"
 #define LEPTON_I2C_ADDR 0x2A
 #define CAPTURE_DURATION 3600 // 1 hour in seconds
@@ -47,15 +49,29 @@ int lepton_cci_write(int fd, uint16_t command_id, uint16_t value) {
 }
 
 int main(int argc, char *argv[]) {
-    int lepton_fd, i2c_fd;
+    int video_fd, i2c_fd;
     uint16_t frame[FRAME_WIDTH * FRAME_HEIGHT];
     char filename[64];
     time_t start_time, now;
+    struct v4l2_format fmt;
+    struct v4l2_buffer buf;
 
-    // Open Lepton device (adjust path based on driver)
-    lepton_fd = open("/dev/lepton", O_RDWR);
-    if (lepton_fd < 0) {
-        perror("Failed to open Lepton device");
+    // Open V4L2 device
+    video_fd = open(VIDEO_DEVICE, O_RDWR);
+    if (video_fd < 0) {
+        perror("Failed to open video device");
+        return -1;
+    }
+
+    // Set V4L2 format
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = FRAME_WIDTH;
+    fmt.fmt.pix.height = FRAME_HEIGHT;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_Y16; // 16-bit grayscale
+    if (ioctl(video_fd, VIDIOC_S_FMT, &fmt) < 0) {
+        perror("Failed to set video format");
+        close(video_fd);
         return -1;
     }
 
@@ -63,7 +79,7 @@ int main(int argc, char *argv[]) {
     i2c_fd = open(I2C_DEVICE, O_RDWR);
     if (i2c_fd < 0) {
         perror("Failed to open I2C device");
-        close(lepton_fd);
+        close(video_fd);
         return -1;
     }
 
@@ -79,6 +95,15 @@ int main(int argc, char *argv[]) {
         printf("Radiometry enabled\n");
     }
 
+    // Start streaming
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(video_fd, VIDIOC_STREAMON, &type) < 0) {
+        perror("Failed to start streaming");
+        close(i2c_fd);
+        close(video_fd);
+        return -1;
+    }
+
     // Record start time
     start_time = time(NULL);
     printf("Capturing frames for 1 hour starting at %s", ctime(&start_time));
@@ -91,10 +116,22 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Read frame from Lepton
-        ssize_t bytes_read = read(lepton_fd, frame, FRAME_SIZE);
+        // Read frame from V4L2
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(video_fd, VIDIOC_DQBUF, &buf) < 0) {
+            perror("Failed to dequeue buffer");
+            continue;
+        }
+
+        // Copy frame data
+        ssize_t bytes_read = read(video_fd, frame, FRAME_SIZE);
         if (bytes_read != FRAME_SIZE) {
             fprintf(stderr, "Failed to read frame\n");
+            if (ioctl(video_fd, VIDIOC_QBUF, &buf) < 0) {
+                perror("Failed to requeue buffer");
+            }
             continue;
         }
 
@@ -105,17 +142,31 @@ int main(int argc, char *argv[]) {
         FILE *file = fopen(filename, "wb");
         if (!file) {
             perror("Failed to open output file");
+            if (ioctl(video_fd, VIDIOC_QBUF, &buf) < 0) {
+                perror("Failed to requeue buffer");
+            }
             continue;
         }
         fwrite(frame, sizeof(uint16_t), FRAME_WIDTH * FRAME_HEIGHT, file);
         fclose(file);
         printf("Saved frame to %s\n", filename);
 
+        // Requeue buffer
+        if (ioctl(video_fd, VIDIOC_QBUF, &buf) < 0) {
+            perror("Failed to requeue buffer");
+            break;
+        }
+
         // Sleep to control frame rate (~9 FPS for Lepton)
         usleep(111111);
     }
 
+    // Stop streaming
+    if (ioctl(video_fd, VIDIOC_STREAMOFF, &type) < 0) {
+        perror("Failed to stop streaming");
+    }
+
     close(i2c_fd);
-    close(lepton_fd);
+    close(video_fd);
     return 0;
 }
